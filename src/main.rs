@@ -1,8 +1,8 @@
-use chrono::Local;
+use chrono::{Local, Utc};
 use dotenvy::dotenv;
 use serde::{Deserialize, Serialize};
 use sled::Db;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use teloxide::{
     dispatching::{Dispatcher, UpdateFilterExt},
     dptree,
@@ -32,6 +32,10 @@ struct User {
     log: Vec<String>,
     notes: Vec<String>,
     input: InputMode,
+
+    // reminders
+    awaiting_ping: bool,
+    last_ping_ts: i64,
 }
 
 impl Default for User {
@@ -43,6 +47,8 @@ impl Default for User {
             log: vec![],
             notes: vec![],
             input: InputMode::None,
+            awaiting_ping: false,
+            last_ping_ts: 0,
         }
     }
 }
@@ -78,6 +84,11 @@ fn xp_to_next(level: u32) -> u32 {
 fn log(user: &mut User, text: impl Into<String>) {
     let ts = Local::now().format("%d.%m %H:%M");
     user.log.insert(0, format!("{} — {}", ts, text.into()));
+}
+
+fn punish(user: &mut User, xp: u32) {
+    user.xp = user.xp.saturating_sub(xp);
+    log(user, format!("❌ Прокрастинация (-{} XP)", xp));
 }
 
 fn complete_quest(user: &mut User, name: &str, xp: u32, gold: u32) -> Option<u32> {
@@ -147,6 +158,19 @@ fn notes_menu() -> InlineKeyboardMarkup {
     ])
 }
 
+fn reminder_menu() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("✅ Делаю", "doing"),
+        InlineKeyboardButton::callback("❌ Ничего", "nothing"),
+    ]])
+}
+
+fn force_menu() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("✅ Сделал", "forced_done"),
+    ]])
+}
+
 /* ===================== BOT ===================== */
 
 #[tokio::main]
@@ -156,6 +180,47 @@ async fn main() {
 
     let bot = Bot::from_env();
     let db = Arc::new(open_db());
+
+    /* ===== BACKGROUND REMINDER ===== */
+    {
+        let bot = bot.clone();
+        let db = db.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(900));
+
+            loop {
+                interval.tick().await;
+
+                for item in db.scan_prefix("user:") {
+                    let Ok((k, v)) = item else { continue };
+                    let Ok(mut user) = serde_json::from_slice::<User>(&v) else { continue };
+
+                    let user_id: u64 = String::from_utf8_lossy(&k)
+                        .replace("user:", "")
+                        .parse()
+                        .unwrap();
+
+                    if user.awaiting_ping {
+                        punish(&mut user, 20);
+                    }
+
+                    user.awaiting_ping = true;
+                    user.last_ping_ts = Utc::now().timestamp();
+
+                    save_user(&db, user_id, &user);
+
+                    let _ = bot
+                        .send_message(
+                            ChatId(user_id as i64),
+                            "⏰ Что ты сделал для поиска работы?",
+                        )
+                        .reply_markup(reminder_menu())
+                        .await;
+                }
+            }
+        });
+    }
 
     let handler = dptree::entry()
         // /start
@@ -179,7 +244,7 @@ async fn main() {
                     }
                 }),
         )
-        // обычный текст (заметки)
+        // text (notes)
         .branch(
             Update::filter_message()
                 .filter(|m: Message| m.text().is_some())
@@ -190,7 +255,6 @@ async fn main() {
                         async move {
                             let Some(from) = msg.from() else { return Ok(()); };
                             let text = msg.text().unwrap();
-
                             let mut user = load_user(&db, from.id.0);
 
                             if let InputMode::AddNote = user.input {
@@ -208,7 +272,7 @@ async fn main() {
                     }
                 }),
         )
-        // callback
+        // callbacks
         .branch(
             Update::filter_callback_query().endpoint({
                 let db = db.clone();
@@ -226,7 +290,7 @@ async fn main() {
         .await;
 }
 
-/* ===================== CALLBACK HANDLER ===================== */
+/* ===================== CALLBACKS ===================== */
 
 async fn handle_callback(bot: Bot, q: CallbackQuery, db: Arc<Db>) -> ResponseResult<()> {
     let Some(data) = q.data.as_deref() else {
@@ -256,17 +320,31 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, db: Arc<Db>) -> ResponseRes
             main_menu(),
         ),
         "quests" => ("📜 Выбери квест".into(), quest_menu()),
-        "log" => (
-            format!("📖 Журнал\n\n{}", user.log.join("\n")),
-            main_menu(),
-        ),
-        "notes" => (
-            format!("🗒 Заметки\n\n{}", user.notes.join("\n")),
-            notes_menu(),
-        ),
+        "log" => (format!("📖 Журнал\n\n{}", user.log.join("\n")), main_menu()),
+        "notes" => (format!("🗒 Заметки\n\n{}", user.notes.join("\n")), notes_menu()),
         "add_note" => {
             user.input = InputMode::AddNote;
-            ("✍️ Напиши текст заметки одним сообщением".into(), InlineKeyboardMarkup::default())
+            ("✍️ Напиши текст заметки".into(), InlineKeyboardMarkup::default())
+        }
+        "doing" => {
+            user.awaiting_ping = false;
+            ("👍 Отлично, продолжай".into(), main_menu())
+        }
+        "nothing" => {
+            user.awaiting_ping = false;
+            let bot = bot.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let _ = bot
+                    .send_message(chat_id, "⏳ Ты сделал хотя бы один отклик?")
+                    .reply_markup(force_menu())
+                    .await;
+            });
+            ("⚠️ Сделай один отклик прямо сейчас".into(), InlineKeyboardMarkup::default())
+        }
+        "forced_done" => {
+            complete_quest(&mut user, "Отклик", 20, 1);
+            ("✅ Засчитано".into(), main_menu())
         }
         "q_apply" => quest(&mut user, "Отклик", 20, 1),
         "q_study" => quest(&mut user, "Учёба", 15, 0),
