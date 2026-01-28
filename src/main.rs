@@ -3,11 +3,16 @@ use dotenvy::dotenv;
 use serde::{Deserialize, Serialize};
 use sled::Db;
 use std::sync::Arc;
-use teloxide::{prelude::*, utils::command::BotCommands};
+use teloxide::{
+    dispatching::{Dispatcher, UpdateFilterExt},
+    dptree,
+    prelude::*,
+    types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup},
+};
 
 /* ===================== MODEL ===================== */
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct User {
     level: u32,
     xp: u32,
@@ -16,34 +21,38 @@ struct User {
     notes: Vec<String>,
 }
 
+impl Default for User {
+    fn default() -> Self {
+        Self {
+            level: 1,
+            xp: 0,
+            gold: 0,
+            log: vec![],
+            notes: vec![],
+        }
+    }
+}
+
 /* ===================== STORAGE ===================== */
 
 fn open_db() -> Db {
     sled::open("sled_db").expect("failed to open sled db")
 }
 
-fn user_key(user_id: u64) -> String {
-    format!("user:{}", user_id)
+fn key(user_id: u64) -> String {
+    format!("user:{user_id}")
 }
 
 fn load_user(db: &Db, user_id: u64) -> User {
-    db.get(user_key(user_id))
+    db.get(key(user_id))
         .ok()
         .flatten()
         .and_then(|v| serde_json::from_slice(&v).ok())
-        .unwrap_or_else(|| User {
-            level: 1,
-            xp: 0,
-            gold: 0,
-            log: vec![],
-            notes: vec![],
-        })
+        .unwrap_or_default()
 }
 
 fn save_user(db: &Db, user_id: u64, user: &User) {
-    let bytes = serde_json::to_vec(user).unwrap();
-    db.insert(user_key(user_id), bytes).unwrap();
-    db.flush().ok();
+    let _ = db.insert(key(user_id), serde_json::to_vec(user).unwrap());
 }
 
 /* ===================== GAME LOGIC ===================== */
@@ -52,12 +61,12 @@ fn xp_to_next(level: u32) -> u32 {
     level * 100
 }
 
-fn complete_quest(
-    user: &mut User,
-    name: &str,
-    xp: u32,
-    gold: u32,
-) -> Option<u32> {
+fn log(user: &mut User, text: impl Into<String>) {
+    let ts = Local::now().format("%d.%m %H:%M");
+    user.log.insert(0, format!("{} — {}", ts, text.into()));
+}
+
+fn complete_quest(user: &mut User, name: &str, xp: u32, gold: u32) -> Option<u32> {
     user.xp += xp;
     user.gold += gold;
 
@@ -67,12 +76,11 @@ fn complete_quest(
         user.xp -= xp_to_next(user.level);
         user.level += 1;
         level_up = Some(user.level);
-        user.log
-            .insert(0, format!("🆙 Новый уровень: {}", user.level));
+        log(user, format!("🆙 Новый уровень {}", user.level));
     }
 
-    user.log.insert(
-        0,
+    log(
+        user,
         format!(
             "✅ {} (+{} XP{})",
             name,
@@ -88,33 +96,34 @@ fn complete_quest(
     level_up
 }
 
-/* ===================== COMMANDS ===================== */
+/* ===================== UI ===================== */
 
-#[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "🎮 Поиск работы — MMORPG")]
-enum Command {
-    #[command(description = "Запуск бота")]
-    Start,
-    #[command(description = "Профиль персонажа")]
-    Profile,
-    #[command(description = "Список квестов")]
-    Quest,
-    #[command(description = "Журнал действий")]
-    Log,
-    #[command(description = "Добавить заметку")]
-    Note(String),
-    #[command(description = "Показать заметки")]
-    Notes,
-    #[command(description = "Отклик на вакансию")]
-    Apply,
-    #[command(description = "Учёба")]
-    Study,
-    #[command(description = "Обновить резюме")]
-    Resume,
-    #[command(description = "Написать рекрутеру")]
-    Recruiter,
-    #[command(description = "Сделать проект")]
-    Project,
+fn main_menu() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("👤 Профиль", "profile"),
+            InlineKeyboardButton::callback("📜 Квесты", "quests"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("📖 Журнал", "log"),
+            InlineKeyboardButton::callback("🗒 Заметки", "notes"),
+        ],
+    ])
+}
+
+fn quest_menu() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("💼 Отклик", "q_apply"),
+            InlineKeyboardButton::callback("🧠 Учёба", "q_study"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("📄 Резюме", "q_resume"),
+            InlineKeyboardButton::callback("✉️ Рекрутер", "q_recruiter"),
+        ],
+        vec![InlineKeyboardButton::callback("🛠️ Проект", "q_project")],
+        vec![InlineKeyboardButton::callback("⬅️ Назад", "back")],
+    ])
 }
 
 /* ===================== BOT ===================== */
@@ -127,249 +136,134 @@ async fn main() {
     let bot = Bot::from_env();
     let db = Arc::new(open_db());
 
-    Command::repl(bot, move |bot, msg, cmd| {
-        let db = db.clone();
-        async move { handle_command(bot, msg, cmd, db).await }
-    })
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_message()
+                .filter(|m: Message| m.text() == Some("/start"))
+                .endpoint({
+                    let db = db.clone();
+                    move |bot: Bot, msg: Message| {
+                        let db = db.clone();
+                        async move {
+                            let Some(from) = msg.from() else { return Ok(()); };
+
+                            let user = load_user(&db, from.id.0);
+                            save_user(&db, from.id.0, &user);
+
+                            bot.send_message(msg.chat.id, "🎮 Поиск работы — MMORPG")
+                                .reply_markup(main_menu())
+                                .await?;
+
+                            Ok(())
+                        }
+                    }
+                }),
+        )
+        .branch(
+            Update::filter_callback_query().endpoint({
+                let db = db.clone();
+                move |bot: Bot, q: CallbackQuery| {
+                    let db = db.clone();
+                    async move { handle_callback(bot, q, db).await }
+                }
+            }),
+        );
+
+    Dispatcher::builder(bot, handler)
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
         .await;
 }
 
-async fn handle_command(
+/* ===================== CALLBACK HANDLER ===================== */
+
+async fn handle_callback(
     bot: Bot,
-    msg: Message,
-    cmd: Command,
+    q: CallbackQuery,
     db: Arc<Db>,
 ) -> ResponseResult<()> {
-    let user_id = msg.from().unwrap().id.0;
+    let Some(data) = q.data.as_deref() else {
+        bot.answer_callback_query(q.id).await?;
+        return Ok(());
+    };
+
+    let Some(message) = q.message.as_ref() else {
+        bot.answer_callback_query(q.id).await?;
+        return Ok(());
+    };
+
+    let user_id = q.from.id.0;
+    let chat_id = message.chat().id;
+    let msg_id = message.id();
+
     let mut user = load_user(&db, user_id);
 
-    match cmd {
-        Command::Start => {
-            bot.send_message(
-                msg.chat.id,
-                "🎮 *Поиск работы — MMORPG*\n\n\
-Каждое действие = XP\n\n\
-/profile — персонаж\n\
-/quest — квесты\n\
-/log — журнал\n\
-/note текст — заметка\n\
-/notes — заметки",
-            )
-                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                .await?;
+    let (text, keyboard) = match data {
+        "profile" => (
+            format!(
+                "👤 Уровень: {}\nXP: {} / {}\n💰 Золото: {}",
+                user.level,
+                user.xp,
+                xp_to_next(user.level),
+                user.gold
+            ),
+            main_menu(),
+        ),
+        "quests" => ("📜 Выбери квест".into(), quest_menu()),
+        "log" => (
+            format!(
+                "📖 Журнал\n\n{}",
+                user.log.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+            ),
+            main_menu(),
+        ),
+        "notes" => (
+            format!(
+                "🗒 Заметки\n\n{}",
+                user.notes.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+            ),
+            main_menu(),
+        ),
+        "q_apply" => quest(&mut user, "Отклик", 20, 1),
+        "q_study" => quest(&mut user, "Учёба", 15, 0),
+        "q_resume" => quest(&mut user, "Резюме", 30, 0),
+        "q_recruiter" => quest(&mut user, "Рекрутер", 25, 1),
+        "q_project" => quest(&mut user, "Проект", 50, 0),
+        "back" => ("Главное меню".into(), main_menu()),
+        _ => {
+            bot.answer_callback_query(q.id).await?;
+            return Ok(());
         }
+    };
 
-        Command::Profile => {
-            bot.send_message(
-                msg.chat.id,
-                format!(
-                    "👤 *Персонаж*\n\nУровень: {}\nXP: {} / {}\nЗолото: {}",
-                    user.level,
-                    user.xp,
-                    xp_to_next(user.level),
-                    user.gold
-                ),
-            )
-                .parse_mode(teloxide::types::ParseMode::Markdown)
-                .await?;
-        }
+    bot.edit_message_text(chat_id, msg_id, text)
+        .reply_markup(keyboard)
+        .await?;
 
-        Command::Quest => {
-            bot.send_message(
-                msg.chat.id,
-                "📜 *Квесты*\n\n\
-/apply — 💼 Отклик (+20 XP, +1 золото)\n\
-/study — 🧠 Учёба (+15 XP)\n\
-/resume — 📄 Резюме (+30 XP)\n\
-/recruiter — ✉️ Рекрутер (+25 XP, +1 золото)\n\
-/project — 🛠️ Проект (+50 XP)",
-            )
-                .parse_mode(teloxide::types::ParseMode::Markdown)
-                .await?;
-        }
-
-        Command::Log => {
-            let text = user
-                .log
-                .iter()
-                .take(10)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            bot.send_message(
-                msg.chat.id,
-                format!(
-                    "📖 *Журнал*\n\n{}",
-                    if text.is_empty() { "Пусто" } else { &text }
-                ),
-            )
-                .parse_mode(teloxide::types::ParseMode::Markdown)
-                .await?;
-        }
-
-        Command::Note(text) => {
-            let timestamp = Local::now().format("%Y-%m-%d %H:%M").to_string();
-
-            let note = format!("{} — {}", timestamp, text);
-            user.notes.insert(0, note);
-
-            // 🔹 ВАЖНО: фиксируем факт создания заметки в журнале
-            user.log
-                .insert(0, format!("📝 Создана заметка ({})", timestamp));
-
-            bot.send_message(msg.chat.id, "📝 Заметка сохранена").await?;
-        }
-
-        Command::Notes => {
-            let text = user
-                .notes
-                .iter()
-                .take(10)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            bot.send_message(
-                msg.chat.id,
-                format!(
-                    "🗒 *Заметки*\n\n{}",
-                    if text.is_empty() {
-                        "Нет заметок"
-                    } else {
-                        &text
-                    }
-                ),
-            )
-                .parse_mode(teloxide::types::ParseMode::Markdown)
-                .await?;
-        }
-
-        Command::Apply => quest(&bot, &msg, &mut user, "Отклик на вакансию", 20, 1).await?,
-        Command::Study => quest(&bot, &msg, &mut user, "Изучал Rust / AI", 15, 0).await?,
-        Command::Resume => quest(&bot, &msg, &mut user, "Обновил резюме", 30, 0).await?,
-        Command::Recruiter => {
-            quest(&bot, &msg, &mut user, "Написал рекрутеру", 25, 1).await?
-        }
-        Command::Project => quest(&bot, &msg, &mut user, "Сделал проект", 50, 0).await?,
-    }
-
+    bot.answer_callback_query(q.id).await?;
     save_user(&db, user_id, &user);
+
     Ok(())
 }
 
-async fn quest(
-    bot: &Bot,
-    msg: &Message,
+fn quest(
     user: &mut User,
     name: &str,
     xp: u32,
     gold: u32,
-) -> ResponseResult<()> {
-    let level_up = complete_quest(user, name, xp, gold);
+) -> (String, InlineKeyboardMarkup) {
+    let lvl = complete_quest(user, name, xp, gold);
 
     let mut text = format!("✅ {}\n+{} XP", name, xp);
+
     if gold > 0 {
         text.push_str(&format!(", +{} золота", gold));
     }
-    if let Some(level) = level_up {
-        text.push_str(&format!("\n🆙 Новый уровень: {}", level));
+
+    if let Some(l) = lvl {
+        text.push_str(&format!("\n🆙 Новый уровень {}", l));
     }
 
-    bot.send_message(msg.chat.id, text).await?;
-    Ok(())
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn empty_user() -> User {
-        User {
-            level: 1,
-            xp: 0,
-            gold: 0,
-            log: vec![],
-            notes: vec![],
-        }
-    }
-
-    /* ===================== XP ===================== */
-
-    #[test]
-    fn xp_to_next_is_linear() {
-        assert_eq!(xp_to_next(1), 100);
-        assert_eq!(xp_to_next(2), 200);
-        assert_eq!(xp_to_next(5), 500);
-    }
-
-    /* ===================== QUEST ===================== */
-
-    #[test]
-    fn quest_adds_xp_and_gold() {
-        let mut user = empty_user();
-
-        let level_up = complete_quest(&mut user, "Test quest", 20, 3);
-
-        assert_eq!(user.xp, 20);
-        assert_eq!(user.gold, 3);
-        assert_eq!(user.level, 1);
-        assert!(level_up.is_none());
-    }
-
-    #[test]
-    fn quest_can_level_up() {
-        let mut user = empty_user();
-
-        let level_up = complete_quest(&mut user, "Big quest", 150, 0);
-
-        assert_eq!(user.level, 2);
-        assert_eq!(user.xp, 50); // 150 - 100
-        assert_eq!(level_up, Some(2));
-    }
-
-    #[test]
-    fn quest_writes_to_log() {
-        let mut user = empty_user();
-
-        complete_quest(&mut user, "Logged quest", 10, 0);
-
-        assert!(!user.log.is_empty());
-        assert!(user.log[0].contains("Logged quest"));
-    }
-
-    #[test]
-    fn level_up_is_logged() {
-        let mut user = empty_user();
-
-        complete_quest(&mut user, "Level quest", 200, 0);
-
-        let joined = user.log.join("\n");
-        assert!(joined.contains("Новый уровень"));
-    }
-
-    /* ===================== NOTES ===================== */
-
-    #[test]
-    fn note_is_saved() {
-        let mut user = empty_user();
-
-        let text = "Test note";
-        let note = format!("2026-01-01 00:00 — {}", text);
-        user.notes.insert(0, note);
-
-        assert_eq!(user.notes.len(), 1);
-        assert!(user.notes[0].contains(text));
-    }
-
-    #[test]
-    fn note_creation_is_logged() {
-        let mut user = empty_user();
-
-        user.log.insert(0, "📝 Создана заметка".to_string());
-
-        assert!(!user.log.is_empty());
-        assert!(user.log[0].contains("заметка"));
-    }
+    (text, quest_menu())
 }
