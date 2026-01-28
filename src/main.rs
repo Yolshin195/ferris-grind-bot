@@ -13,12 +13,25 @@ use teloxide::{
 /* ===================== MODEL ===================== */
 
 #[derive(Serialize, Deserialize)]
+enum InputMode {
+    None,
+    AddNote,
+}
+
+impl Default for InputMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct User {
     level: u32,
     xp: u32,
     gold: u32,
     log: Vec<String>,
     notes: Vec<String>,
+    input: InputMode,
 }
 
 impl Default for User {
@@ -29,6 +42,7 @@ impl Default for User {
             gold: 0,
             log: vec![],
             notes: vec![],
+            input: InputMode::None,
         }
     }
 }
@@ -126,6 +140,13 @@ fn quest_menu() -> InlineKeyboardMarkup {
     ])
 }
 
+fn notes_menu() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback("➕ Добавить заметку", "add_note")],
+        vec![InlineKeyboardButton::callback("⬅️ Назад", "back")],
+    ])
+}
+
 /* ===================== BOT ===================== */
 
 #[tokio::main]
@@ -137,6 +158,7 @@ async fn main() {
     let db = Arc::new(open_db());
 
     let handler = dptree::entry()
+        // /start
         .branch(
             Update::filter_message()
                 .filter(|m: Message| m.text() == Some("/start"))
@@ -146,19 +168,47 @@ async fn main() {
                         let db = db.clone();
                         async move {
                             let Some(from) = msg.from() else { return Ok(()); };
-
                             let user = load_user(&db, from.id.0);
                             save_user(&db, from.id.0, &user);
 
                             bot.send_message(msg.chat.id, "🎮 Поиск работы — MMORPG")
                                 .reply_markup(main_menu())
                                 .await?;
-
                             Ok(())
                         }
                     }
                 }),
         )
+        // обычный текст (заметки)
+        .branch(
+            Update::filter_message()
+                .filter(|m: Message| m.text().is_some())
+                .endpoint({
+                    let db = db.clone();
+                    move |bot: Bot, msg: Message| {
+                        let db = db.clone();
+                        async move {
+                            let Some(from) = msg.from() else { return Ok(()); };
+                            let text = msg.text().unwrap();
+
+                            let mut user = load_user(&db, from.id.0);
+
+                            if let InputMode::AddNote = user.input {
+                                user.notes.insert(0, text.to_string());
+                                log(&mut user, "📝 Создана заметка");
+                                user.input = InputMode::None;
+                                save_user(&db, from.id.0, &user);
+
+                                bot.send_message(msg.chat.id, "✅ Заметка сохранена")
+                                    .reply_markup(main_menu())
+                                    .await?;
+                            }
+                            Ok(())
+                        }
+                    }
+                }),
+        )
+        // callback
         .branch(
             Update::filter_callback_query().endpoint({
                 let db = db.clone();
@@ -178,16 +228,11 @@ async fn main() {
 
 /* ===================== CALLBACK HANDLER ===================== */
 
-async fn handle_callback(
-    bot: Bot,
-    q: CallbackQuery,
-    db: Arc<Db>,
-) -> ResponseResult<()> {
+async fn handle_callback(bot: Bot, q: CallbackQuery, db: Arc<Db>) -> ResponseResult<()> {
     let Some(data) = q.data.as_deref() else {
         bot.answer_callback_query(q.id).await?;
         return Ok(());
     };
-
     let Some(message) = q.message.as_ref() else {
         bot.answer_callback_query(q.id).await?;
         return Ok(());
@@ -212,19 +257,17 @@ async fn handle_callback(
         ),
         "quests" => ("📜 Выбери квест".into(), quest_menu()),
         "log" => (
-            format!(
-                "📖 Журнал\n\n{}",
-                user.log.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
-            ),
+            format!("📖 Журнал\n\n{}", user.log.join("\n")),
             main_menu(),
         ),
         "notes" => (
-            format!(
-                "🗒 Заметки\n\n{}",
-                user.notes.iter().take(10).cloned().collect::<Vec<_>>().join("\n")
-            ),
-            main_menu(),
+            format!("🗒 Заметки\n\n{}", user.notes.join("\n")),
+            notes_menu(),
         ),
+        "add_note" => {
+            user.input = InputMode::AddNote;
+            ("✍️ Напиши текст заметки одним сообщением".into(), InlineKeyboardMarkup::default())
+        }
         "q_apply" => quest(&mut user, "Отклик", 20, 1),
         "q_study" => quest(&mut user, "Учёба", 15, 0),
         "q_resume" => quest(&mut user, "Резюме", 30, 0),
@@ -237,30 +280,23 @@ async fn handle_callback(
         }
     };
 
+    save_user(&db, user_id, &user);
+
     bot.edit_message_text(chat_id, msg_id, text)
         .reply_markup(keyboard)
         .await?;
 
     bot.answer_callback_query(q.id).await?;
-    save_user(&db, user_id, &user);
-
     Ok(())
 }
 
-fn quest(
-    user: &mut User,
-    name: &str,
-    xp: u32,
-    gold: u32,
-) -> (String, InlineKeyboardMarkup) {
+fn quest(user: &mut User, name: &str, xp: u32, gold: u32) -> (String, InlineKeyboardMarkup) {
     let lvl = complete_quest(user, name, xp, gold);
 
     let mut text = format!("✅ {}\n+{} XP", name, xp);
-
     if gold > 0 {
         text.push_str(&format!(", +{} золота", gold));
     }
-
     if let Some(l) = lvl {
         text.push_str(&format!("\n🆙 Новый уровень {}", l));
     }
