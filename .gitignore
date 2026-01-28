@@ -2,3 +2,5 @@
 
 .env
 .idea
+
+/sled_db
