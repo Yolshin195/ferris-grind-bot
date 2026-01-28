@@ -10,7 +10,9 @@ use teloxide::{
     types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup},
 };
 
-/* ===================== MODEL ===================== */
+/* =========================================================
+   DOMAIN (Entities + pure logic)
+   ========================================================= */
 
 #[derive(Serialize, Deserialize)]
 enum InputMode {
@@ -24,7 +26,7 @@ impl Default for InputMode {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 struct User {
     level: u32,
     xp: u32,
@@ -33,95 +35,133 @@ struct User {
     notes: Vec<String>,
     input: InputMode,
 
-    // reminders
     awaiting_ping: bool,
     last_ping_ts: i64,
 }
-
-impl Default for User {
-    fn default() -> Self {
-        Self {
-            level: 1,
-            xp: 0,
-            gold: 0,
-            log: vec![],
-            notes: vec![],
-            input: InputMode::None,
-            awaiting_ping: false,
-            last_ping_ts: 0,
-        }
-    }
-}
-
-/* ===================== STORAGE ===================== */
-
-fn open_db() -> Db {
-    sled::open("sled_db").expect("failed to open sled db")
-}
-
-fn key(user_id: u64) -> String {
-    format!("user:{user_id}")
-}
-
-fn load_user(db: &Db, user_id: u64) -> User {
-    db.get(key(user_id))
-        .ok()
-        .flatten()
-        .and_then(|v| serde_json::from_slice(&v).ok())
-        .unwrap_or_default()
-}
-
-fn save_user(db: &Db, user_id: u64, user: &User) {
-    let _ = db.insert(key(user_id), serde_json::to_vec(user).unwrap());
-}
-
-/* ===================== GAME LOGIC ===================== */
 
 fn xp_to_next(level: u32) -> u32 {
     level * 100
 }
 
-fn log(user: &mut User, text: impl Into<String>) {
-    let ts = Local::now().format("%d.%m %H:%M");
-    user.log.insert(0, format!("{} — {}", ts, text.into()));
+/* =========================================================
+   REPOSITORY (DB access)
+   ========================================================= */
+
+struct UserRepository {
+    db: Db,
 }
 
-fn punish(user: &mut User, xp: u32) {
-    user.xp = user.xp.saturating_sub(xp);
-    log(user, format!("❌ Прокрастинация (-{} XP)", xp));
-}
-
-fn complete_quest(user: &mut User, name: &str, xp: u32, gold: u32) -> Option<u32> {
-    user.xp += xp;
-    user.gold += gold;
-
-    let mut level_up = None;
-
-    while user.xp >= xp_to_next(user.level) {
-        user.xp -= xp_to_next(user.level);
-        user.level += 1;
-        level_up = Some(user.level);
-        log(user, format!("🆙 Новый уровень {}", user.level));
+impl UserRepository {
+    fn new() -> Self {
+        Self {
+            db: sled::open("sled_db").expect("failed to open sled db"),
+        }
     }
 
-    log(
-        user,
-        format!(
-            "✅ {} (+{} XP{})",
-            name,
-            xp,
-            if gold > 0 {
-                format!(", +{} золота", gold)
-            } else {
-                "".into()
-            }
-        ),
-    );
+    fn key(user_id: u64) -> String {
+        format!("user:{user_id}")
+    }
 
-    level_up
+    fn load(&self, user_id: u64) -> User {
+        self.db
+            .get(Self::key(user_id))
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_slice(&v).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, user_id: u64, user: &User) {
+        let _ = self
+            .db
+            .insert(Self::key(user_id), serde_json::to_vec(user).unwrap());
+    }
+
+    fn all(&self) -> Vec<(u64, User)> {
+        self.db
+            .scan_prefix("user:")
+            .filter_map(|res| {
+                let (k, v) = res.ok()?;
+                let id = String::from_utf8_lossy(&k)
+                    .replace("user:", "")
+                    .parse()
+                    .ok()?;
+                let user = serde_json::from_slice(&v).ok()?;
+                Some((id, user))
+            })
+            .collect()
+    }
 }
 
-/* ===================== UI ===================== */
+/* =========================================================
+   SERVICE (Business logic)
+   ========================================================= */
+
+struct UserService {
+    repo: Arc<UserRepository>,
+}
+
+impl UserService {
+    fn new(repo: Arc<UserRepository>) -> Self {
+        Self { repo }
+    }
+
+    fn load(&self, user_id: u64) -> User {
+        self.repo.load(user_id)
+    }
+
+    fn save(&self, user_id: u64, user: &User) {
+        self.repo.save(user_id, user)
+    }
+
+    fn log(user: &mut User, text: impl Into<String>) {
+        let ts = Local::now().format("%d.%m %H:%M");
+        user.log.insert(0, format!("{} — {}", ts, text.into()));
+    }
+
+    fn punish(user: &mut User, xp: u32) {
+        user.xp = user.xp.saturating_sub(xp);
+        Self::log(user, format!("❌ Прокрастинация (-{} XP)", xp));
+    }
+
+    fn complete_quest(
+        user: &mut User,
+        name: &str,
+        xp: u32,
+        gold: u32,
+    ) -> Option<u32> {
+        user.xp += xp;
+        user.gold += gold;
+
+        let mut level_up = None;
+        while user.xp >= xp_to_next(user.level) {
+            user.xp -= xp_to_next(user.level);
+            user.level += 1;
+            level_up = Some(user.level);
+            Self::log(user, format!("🆙 Новый уровень {}", user.level));
+        }
+
+        Self::log(
+            user,
+            format!(
+                "✅ {} (+{} XP{})",
+                name,
+                xp,
+                if gold > 0 {
+                    format!(", +{} золота", gold)
+                } else {
+                    "".into()
+                }
+            ),
+        );
+
+        level_up
+    }
+}
+
+/* =========================================================
+   UI (keyboards)
+   ========================================================= */
 
 fn main_menu() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
@@ -171,7 +211,9 @@ fn force_menu() -> InlineKeyboardMarkup {
     ]])
 }
 
-/* ===================== BOT ===================== */
+/* =========================================================
+   BOT
+   ========================================================= */
 
 #[tokio::main]
 async fn main() {
@@ -179,36 +221,27 @@ async fn main() {
     pretty_env_logger::init();
 
     let bot = Bot::from_env();
-    let db = Arc::new(open_db());
+    let repo = Arc::new(UserRepository::new());
+    let service = Arc::new(UserService::new(repo.clone()));
 
     /* ===== BACKGROUND REMINDER ===== */
     {
         let bot = bot.clone();
-        let db = db.clone();
+        let service = service.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(900));
-
             loop {
                 interval.tick().await;
 
-                for item in db.scan_prefix("user:") {
-                    let Ok((k, v)) = item else { continue };
-                    let Ok(mut user) = serde_json::from_slice::<User>(&v) else { continue };
-
-                    let user_id: u64 = String::from_utf8_lossy(&k)
-                        .replace("user:", "")
-                        .parse()
-                        .unwrap();
-
+                for (user_id, mut user) in service.repo.all() {
                     if user.awaiting_ping {
-                        punish(&mut user, 20);
+                        UserService::punish(&mut user, 20);
                     }
 
                     user.awaiting_ping = true;
                     user.last_ping_ts = Utc::now().timestamp();
-
-                    save_user(&db, user_id, &user);
+                    service.save(user_id, &user);
 
                     let _ = bot
                         .send_message(
@@ -228,13 +261,13 @@ async fn main() {
             Update::filter_message()
                 .filter(|m: Message| m.text() == Some("/start"))
                 .endpoint({
-                    let db = db.clone();
+                    let service = service.clone();
                     move |bot: Bot, msg: Message| {
-                        let db = db.clone();
+                        let service = service.clone();
                         async move {
                             let Some(from) = msg.from() else { return Ok(()); };
-                            let user = load_user(&db, from.id.0);
-                            save_user(&db, from.id.0, &user);
+                            let user = service.load(from.id.0);
+                            service.save(from.id.0, &user);
 
                             bot.send_message(msg.chat.id, "🎮 Поиск работы — MMORPG")
                                 .reply_markup(main_menu())
@@ -249,19 +282,19 @@ async fn main() {
             Update::filter_message()
                 .filter(|m: Message| m.text().is_some())
                 .endpoint({
-                    let db = db.clone();
+                    let service = service.clone();
                     move |bot: Bot, msg: Message| {
-                        let db = db.clone();
+                        let service = service.clone();
                         async move {
                             let Some(from) = msg.from() else { return Ok(()); };
                             let text = msg.text().unwrap();
-                            let mut user = load_user(&db, from.id.0);
+                            let mut user = service.load(from.id.0);
 
                             if let InputMode::AddNote = user.input {
                                 user.notes.insert(0, text.to_string());
-                                log(&mut user, "📝 Создана заметка");
+                                UserService::log(&mut user, "📝 Создана заметка");
                                 user.input = InputMode::None;
-                                save_user(&db, from.id.0, &user);
+                                service.save(from.id.0, &user);
 
                                 bot.send_message(msg.chat.id, "✅ Заметка сохранена")
                                     .reply_markup(main_menu())
@@ -275,10 +308,10 @@ async fn main() {
         // callbacks
         .branch(
             Update::filter_callback_query().endpoint({
-                let db = db.clone();
+                let service = service.clone();
                 move |bot: Bot, q: CallbackQuery| {
-                    let db = db.clone();
-                    async move { handle_callback(bot, q, db).await }
+                    let service = service.clone();
+                    async move { handle_callback(bot, q, service).await }
                 }
             }),
         );
@@ -290,25 +323,25 @@ async fn main() {
         .await;
 }
 
-/* ===================== CALLBACKS ===================== */
+/* =========================================================
+   CALLBACKS
+   ========================================================= */
 
-async fn handle_callback(bot: Bot, q: CallbackQuery, db: Arc<Db>) -> ResponseResult<()> {
-    let Some(data) = q.data.as_deref() else {
-        bot.answer_callback_query(q.id).await?;
-        return Ok(());
-    };
-    let Some(message) = q.message.as_ref() else {
-        bot.answer_callback_query(q.id).await?;
-        return Ok(());
-    };
+async fn handle_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    service: Arc<UserService>,
+) -> ResponseResult<()> {
+    let Some(data) = q.data.as_deref() else { return Ok(()) };
+    let Some(msg) = q.message.as_ref() else { return Ok(()) };
 
     let user_id = q.from.id.0;
-    let chat_id = message.chat().id;
-    let msg_id = message.id();
+    let chat_id = msg.chat().id;
+    let msg_id = msg.id();
 
-    let mut user = load_user(&db, user_id);
+    let mut user = service.load(user_id);
 
-    let (text, keyboard) = match data {
+    let (text, kb) = match data {
         "profile" => (
             format!(
                 "👤 Уровень: {}\nXP: {} / {}\n💰 Золото: {}",
@@ -343,7 +376,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, db: Arc<Db>) -> ResponseRes
             ("⚠️ Сделай один отклик прямо сейчас".into(), InlineKeyboardMarkup::default())
         }
         "forced_done" => {
-            complete_quest(&mut user, "Отклик", 20, 1);
+            UserService::complete_quest(&mut user, "Отклик", 20, 1);
             ("✅ Засчитано".into(), main_menu())
         }
         "q_apply" => quest(&mut user, "Отклик", 20, 1),
@@ -352,16 +385,13 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, db: Arc<Db>) -> ResponseRes
         "q_recruiter" => quest(&mut user, "Рекрутер", 25, 1),
         "q_project" => quest(&mut user, "Проект", 50, 0),
         "back" => ("Главное меню".into(), main_menu()),
-        _ => {
-            bot.answer_callback_query(q.id).await?;
-            return Ok(());
-        }
+        _ => return Ok(()),
     };
 
-    save_user(&db, user_id, &user);
+    service.save(user_id, &user);
 
     bot.edit_message_text(chat_id, msg_id, text)
-        .reply_markup(keyboard)
+        .reply_markup(kb)
         .await?;
 
     bot.answer_callback_query(q.id).await?;
@@ -369,7 +399,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, db: Arc<Db>) -> ResponseRes
 }
 
 fn quest(user: &mut User, name: &str, xp: u32, gold: u32) -> (String, InlineKeyboardMarkup) {
-    let lvl = complete_quest(user, name, xp, gold);
+    let lvl = UserService::complete_quest(user, name, xp, gold);
 
     let mut text = format!("✅ {}\n+{} XP", name, xp);
     if gold > 0 {
