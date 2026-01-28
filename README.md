@@ -62,3 +62,70 @@ Each quest gives XP and sometimes gold.
 - **teloxide** — Telegram bot framework
 - **sled** — embedded key-value database
 - **serde** — serialization
+
+---
+
+## 🚀 Getting Started
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/yourname/ferris-grind-bot.git
+cd ferris-grind-bot
+```
+
+### 2. Create `.env`
+
+```env
+TELOXIDE_TOKEN=your_telegram_bot_token
+```
+
+### 3. Run the bot
+
+```bash
+cargo run --release
+```
+
+The bot will create a local `sled_db/` directory automatically.
+
+---
+
+## 🕹 Usage
+
+* `/start` — initialize your character
+* Use inline buttons to navigate
+* Respond to reminders honestly (or suffer XP loss)
+
+The bot works best when left running continuously.
+
+---
+
+## 🔒 Privacy
+
+* No analytics
+* No external APIs
+* No data leaves your machine
+
+Everything is stored locally.
+
+---
+
+## 🧩 Possible Extensions
+
+* Daily quests
+* Streak system
+* Boss fights (weekly goals)
+* Web dashboard
+* Multiple characters per user
+* Export stats to JSON
+
+---
+
+## 🦀 Why Rust?
+
+* Memory safety
+* Low resource usage
+* Excellent async model
+* Perfect for long-running bots
+
+---
