@@ -12,7 +12,7 @@ Built with **Rust**, powered by **teloxide**, and designed to work **locally wit
 
 Job hunting is boring, stressful, and easy to procrastinate on.
 
-`ferris-grind-bot` reframes it as a **MMORPG-like progression system**:
+`ferris-grind-bot` reframes it as a **RPG-like progression system**:
 
 - You complete real-world actions (apply, study, improve CV)
 - The bot rewards you with XP and levels
